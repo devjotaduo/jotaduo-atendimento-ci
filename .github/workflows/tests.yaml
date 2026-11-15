@@ -1,0 +1,91 @@
+name: Tests
+
+# Testa o repositório privado devjotaduo/jotaduo-atendimento em runners hospedados pelo GitHub (gratuitos em repositório público).
+# Disparo: push em run/pr-<número>-<commit>-<execução>-<tentativa> (merge do pull request) ou
+# run/sha-<commit>-<execução>-<tentativa> (commit da main), feito pelo ci-hospedado.yml da origem com uma chave de deploy.
+on:
+  push:
+    branches:
+      - 'run/**'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag ou commit do repositório de origem
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: tests-${{ github.event_name == 'push' && github.ref_name || inputs.ref }}
+  cancel-in-progress: true
+
+run-name: Tests ${{ github.event_name == 'push' && github.ref_name || inputs.ref }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ref: ${{ steps.ref.outputs.ref }}
+    steps:
+      - name: Resolver o ref da origem
+        id: ref
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TRIGGER_BRANCH: ${{ github.ref_name }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          if [ "$EVENT_NAME" != push ]; then echo "ref=$INPUT_REF" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [[ "$TRIGGER_BRANCH" =~ ^run/pr-([0-9]+)-[0-9a-f]{40}-[0-9]+-[0-9]+$ ]]; then
+            echo "ref=refs/pull/${BASH_REMATCH[1]}/merge" >> "$GITHUB_OUTPUT"
+          elif [[ "$TRIGGER_BRANCH" =~ ^run/sha-([0-9a-f]{40})-[0-9]+-[0-9]+$ ]]; then
+            echo "ref=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Branch de disparo inválida."; exit 1
+          fi
+
+  test:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout da origem
+        uses: actions/checkout@v4
+        with:
+          repository: devjotaduo/jotaduo-atendimento
+          ref: ${{ needs.plan.outputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+      - name: Install dependencies
+        # Pacotes @devjotaduo do GitHub Packages: este repositório precisa de acesso de leitura em cada pacote.
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+        run: corepack yarn install --immutable
+      - name: Validate Twenty patch bundle
+        run: node scripts/twenty-patch/tooling/release.mjs --validate-only
+      - name: Validate patch installer syntax
+        run: bash -n scripts/twenty-patch/tooling/install-release.sh
+      - name: Required checks
+        run: corepack yarn check
+
+  limpar:
+    needs: test
+    if: always() && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Apagar a branch de disparo
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+        run: gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH" || true
